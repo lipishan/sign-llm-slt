@@ -316,3 +316,17 @@ def test_decode_fairseq_target_without_fairseq(tmp_path, impl):
         prefix.with_suffix(".en.idx").write_bytes(idx + dim_off.tobytes() + data_off.tobytes()
                                                   + np.array([len(a) for a in arrs], dtype=np.int64).tobytes())
     assert decode_fairseq_target(str(tmp_path), "test", "sign", "en") == ["the signs.", "hello", "<unk> sign"]
+
+
+def test_filter_overlap_removes_whole_videos(tmp_path):
+    import json
+    from llm_slt.filter_overlap import main, video_id
+    assert video_id("--6bmFM9wT4-00:00:11.220-00:00:14.500") == "--6bmFM9wT4"
+    yt = ["--6bmFM9wT4-00:00:11.220-00:00:14.500", "--6bmFM9wT4-00:05:00.000-00:05:03.000",
+          "IK-gGTtu4uM-00:02:58.738-00:03:02.504"]
+    ev = ["--6bmFM9wT4-00:09:00.000-00:09:02.000"]          # same video, different time span
+    for name, ids in [("yt.jsonl", yt), ("test.jsonl", ev)]:
+        (tmp_path / name).write_text("".join(json.dumps({"id": i, "text": "x", "num_frames": 9}) + "\n" for i in ids))
+    main(["--manifest", str(tmp_path / "yt.jsonl"), "--exclude", str(tmp_path / "test.jsonl"),
+          "--out", str(tmp_path / "out.jsonl")])
+    assert [json.loads(l)["id"] for l in open(tmp_path / "out.jsonl")] == [yt[2]]
