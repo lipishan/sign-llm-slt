@@ -1,24 +1,29 @@
 """Look at SHuBERT-style crops for a few clips before extracting features at scale.
 
 Uses SHuBERT's own code (imported from a clone of github.com/ShesterG/SHuBERT),
-with their exact MediaPipe setup: Holistic + FaceLandmarker (6 faces, blendshapes,
+following their QUICKSTART order:
+  1. signer crop-out (dataset/clips_bbox.py): YOLOv8 person boxes; with several
+     people, the person with the most optical-flow motion is the signer; the whole
+     clip is cropped to that person;
+  2. MediaPipe on every frame of the cropped clip, in order, with their exact setup: Holistic + FaceLandmarker (6 faces, blendshapes,
 transformation matrices) + HandLandmarker (6 hands, detection confidence 0.05).
 Their crop functions are called unchanged; the only addition is the upper-face and
 mouth versions of the face crop, which keep the full crop's geometry and paste only
 the eye boxes or only the mouth box onto the grey background.
 
-For each clip it writes one PNG: rows are sampled frames; columns are
-frame | left hand | right hand | face (theirs) | upper face | mouth.
+For each clip it writes one PNG: rows are evenly spaced frames; columns are
+signer-cropped frame | left hand | right hand | face (theirs) | upper face | mouth.
 
 Setup (their feature-extraction versions):
-    pip install mediapipe==0.10.14 decord==0.6.0 opencv-python==4.10.0.84
+    pip install mediapipe==0.10.14 decord==0.6.0 opencv-python==4.10.0.84 ultralytics
+    YOLOv8 weights (their QUICKSTART): https://huggingface.co/Ultralytics/YOLOv8/blob/main/yolov8n.pt
     MediaPipe models: face_landmarker.task and hand_landmarker.task from
     https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker#models
     https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker#models
 
 Example:
     python tools/check_crops.py --shubert-repo ~/SHuBERT \
-        --face-model face_landmarker.task --hand-model hand_landmarker.task \
+        --face-model face_landmarker.task --hand-model hand_landmarker.task --yolo-model yolov8n.pt \
         --video-dir /path/to/youtube-asl/clips --num-clips 8 --out crop_check/
 """
 from __future__ import annotations
@@ -27,6 +32,9 @@ import argparse
 import importlib.util
 import os
 import random
+import sys
+import tempfile
+import types
 
 import numpy as np
 
@@ -48,6 +56,13 @@ def load_shubert(repo, face_model, hand_model):
     kpe = _load("shubert_kpe", os.path.join(repo, "dataset", "kpe_mediapipe.py"))
     face = _load("shubert_crop_face", os.path.join(repo, "dataset", "crop_face.py"))
     hands = _load("shubert_crop_hands", os.path.join(repo, "dataset", "crop_hands.py"))
+    # clips_bbox.py imports facenet_pytorch and webvtt at the top but never uses them
+    for name in ("facenet_pytorch", "webvtt"):
+        if name not in sys.modules:
+            stub = types.ModuleType(name)
+            stub.MTCNN = None
+            sys.modules[name] = stub
+    bbox = _load("shubert_clips_bbox", os.path.join(repo, "dataset", "clips_bbox.py"))
     # same options as kpe_mediapipe.py __main__
     kpe.face_detector = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=face_model),
@@ -56,7 +71,7 @@ def load_shubert(repo, face_model, hand_model):
         base_options=python.BaseOptions(model_asset_path=hand_model),
         num_hands=6, min_hand_detection_confidence=0.05))
     kpe.mp_holistic = mp.solutions.holistic.Holistic(min_detection_confidence=0.1)
-    return kpe, face, hands
+    return kpe, face, hands, bbox
 
 
 def face_part_crop(face_mod, image, facial_landmarks, keep):
@@ -138,6 +153,8 @@ def main(argv=None):
     p.add_argument("--shubert-repo", required=True)
     p.add_argument("--face-model", required=True)
     p.add_argument("--hand-model", required=True)
+    p.add_argument("--yolo-model", help="yolov8n.pt for SHuBERT's signer crop-out (step 1)")
+    p.add_argument("--no-signer-crop", action="store_true", help="skip step 1 (not SHuBERT's pipeline)")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--video-dir", help="folder of .mp4 clips (searched recursively); --num-clips are sampled")
     src.add_argument("--videos", nargs="+", help="explicit list of video files")
@@ -149,21 +166,34 @@ def main(argv=None):
 
     import cv2
     import decord
-    kpe, face_mod, hand_mod = load_shubert(args.shubert_repo, args.face_model, args.hand_model)
+    if not args.no_signer_crop and not args.yolo_model:
+        p.error("give --yolo-model (SHuBERT step 1), or --no-signer-crop")
+    kpe, face_mod, hand_mod, bbox_mod = load_shubert(args.shubert_repo, args.face_model, args.hand_model)
     os.makedirs(args.out, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="signer_crop_")
     videos = sorted(args.videos) if args.videos else sample_videos(args.video_dir, args.num_clips, args.seed)
     random.Random(args.seed).shuffle(videos)
     counts = np.zeros(5)
     n_frames = 0
     for video in videos[: args.num_clips]:
-        vr = decord.VideoReader(video)
-        idx = np.linspace(0, len(vr) - 1, args.frames_per_clip).round().astype(int)
-        frames = vr.get_batch(list(idx)).asnumpy()          # decoded in one sequential pass
+        clip = video
+        if not args.no_signer_crop:
+            cropped = os.path.join(tmp, os.path.basename(video))
+            bbox_mod.crop_clip(video, os.path.join(tmp, "problems.txt"), cropped, args.yolo_model)
+            if os.path.exists(cropped):
+                clip = cropped
+            else:
+                print("signer crop failed, using the full frame:", video)
+        vr = decord.VideoReader(clip)
+        frames = vr.get_batch(list(range(len(vr)))).asnumpy()   # every frame, in order, as SHuBERT does
+        show = set(np.linspace(0, len(frames) - 1, args.frames_per_clip).round().astype(int).tolist())
         rows = []
-        for fr in frames:
-            crops = crops_for_frame(kpe, face_mod, hand_mod, fr)
+        for t, fr in enumerate(frames):
+            crops = crops_for_frame(kpe, face_mod, hand_mod, fr)   # MediaPipe tracks frame to frame
             counts += [c is not None for c in crops]
             n_frames += 1
+            if t not in show:
+                continue
             thumb = cv2.cvtColor(fr, cv2.COLOR_RGB2BGR)
             thumb = cv2.resize(thumb, (int(224 * thumb.shape[1] / thumb.shape[0]), 224))
             cells = [thumb] + [c if c is not None else np.zeros((224, 224, 3), np.uint8) for c in crops]
@@ -172,7 +202,7 @@ def main(argv=None):
         cv2.imwrite(os.path.join(args.out, f"{name}.png"), np.concatenate(rows, axis=0))
         print("wrote", os.path.join(args.out, f"{name}.png"))
     names = ["left hand", "right hand", "face", "upper face", "mouth"]
-    print("detected in", n_frames, "frames:", ", ".join(f"{n} {c / max(1, n_frames):.0%}" for n, c in zip(names, counts)))
+    print("detected in", n_frames, "frames (all frames of the sampled clips):", ", ".join(f"{n} {c / max(1, n_frames):.0%}" for n, c in zip(names, counts)))
 
 
 if __name__ == "__main__":
