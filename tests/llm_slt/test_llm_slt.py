@@ -288,3 +288,31 @@ def test_make_manifest_drops_clips_without_face(tmp_path):
           "--face-root", str(tmp_path / "faces"), "--out", str(tmp_path / "out.jsonl")])
     lines = [json.loads(l) for l in open(tmp_path / "out.jsonl")]
     assert lines == [{"id": "a", "text": "hello", "num_frames": 5}]
+
+
+@pytest.mark.parametrize("impl", ["mmap", "cached"])
+def test_decode_fairseq_target_without_fairseq(tmp_path, impl):
+    """Write a binarized target the way fairseq's builders do, then decode it without fairseq."""
+    import struct
+    from llm_slt.make_manifest import decode_fairseq_target
+    toks = ["▁the", "▁sign", "s", "▁hello", "."]
+    (tmp_path / "dict.en.txt").write_text("".join(f"{t} {9 - i}\n" for i, t in enumerate(toks)), encoding="utf-8")
+    sents = [[4, 5, 6, 8, 2], [7, 2], [3, 5, 2]]                 # ids: 0 <s> 1 <pad> 2 </s> 3 <unk>
+    prefix = tmp_path / "test.sign-en.en"
+    if impl == "mmap":
+        arrs = [np.array(s, dtype=np.uint16) for s in sents]
+        prefix.with_suffix(".en.bin").write_bytes(b"".join(a.tobytes() for a in arrs))
+        sizes = np.array([len(a) for a in arrs], dtype=np.int32)
+        ptrs = np.concatenate([[0], np.cumsum(sizes[:-1]) * 2]).astype(np.int64)
+        idx = b"MMIDIDX\x00\x00" + struct.pack("<Q", 1) + struct.pack("<B", 8) + struct.pack("<Q", len(arrs))
+        prefix.with_suffix(".en.idx").write_bytes(idx + sizes.tobytes() + ptrs.tobytes())
+    else:
+        arrs = [np.array(s, dtype=np.int32) + 1 for s in sents]  # cached format stores id + 1
+        prefix.with_suffix(".en.bin").write_bytes(b"".join(a.tobytes() for a in arrs))
+        data_off = np.concatenate([[0], np.cumsum([len(a) for a in arrs])]).astype(np.int64)
+        dim_off = np.arange(len(arrs) + 1, dtype=np.int64)
+        idx = (b"TNTIDX\x00\x00" + struct.pack("<Q", 1) + struct.pack("<QQ", 4, 4)
+               + struct.pack("<QQ", len(arrs), len(arrs)))
+        prefix.with_suffix(".en.idx").write_bytes(idx + dim_off.tobytes() + data_off.tobytes()
+                                                  + np.array([len(a) for a in arrs], dtype=np.int64).tobytes())
+    assert decode_fairseq_target(str(tmp_path), "test", "sign", "en") == ["the signs.", "hello", "<unk> sign"]
