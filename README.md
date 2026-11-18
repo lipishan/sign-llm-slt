@@ -44,6 +44,12 @@ unchanged at every LLM layer.
 | upper_face | brows (17–26) + eyes (36–47) | 44 |
 | mouth | mouth (48–67) | 40 |
 
+Body and hands are SMPL-X pose rotations (axis-angle), as in CSI. The face is 2D
+landmarks: from the `face_pose` key of the .npz (OpenASL), or, for YouTube-ASL, from
+RTMPose wholebody `.pkl` files given with `--face-root` (COCO-WholeBody points 23–90,
+which are the 68 iBUG landmarks). Use `make_manifest --face-root` to keep only clips
+that have a face file.
+
 `--face-norm similarity` removes translation, scale and in-plane rotation from the
 face landmarks using the outer eye corners, so head motion stays in the body stream.
 `--no-split-face` gives the CSI layout (one 136-d face stream).

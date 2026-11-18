@@ -7,13 +7,14 @@ set -x -e -u -o pipefail
 CKPT=${CKPT:?set CKPT}
 DATA=${DATA:-data/llm/ytasl}
 FEAT_ROOT=${FEAT_ROOT:-/mnt/pub/sign_language_datasets/features/YouTube-ASL/osx/video-clips-stacked}
+FACE_ROOT=${FACE_ROOT:-/mnt/pub/sign_language_datasets/features/YouTube-ASL/rtmpose_lmk}   # RTMPose face .pkl files
 BEAM=${BEAM:-5}
 ABLATION=${ABLATION:-zero}               # zero | resample
 
-python -m llm_slt.evaluate --ckpt-dir ${CKPT} --manifest ${DATA}/test.jsonl --feat-root ${FEAT_ROOT} \
+python -m llm_slt.evaluate --ckpt-dir ${CKPT} --manifest ${DATA}/test.jsonl --feat-root ${FEAT_ROOT} --face-root ${FACE_ROOT} \
     --beam ${BEAM} --out ${CKPT}/eval/test_beam${BEAM}
 
 for S in body left right upper_face mouth; do
-  python -m llm_slt.evaluate --ckpt-dir ${CKPT} --manifest ${DATA}/test.jsonl --feat-root ${FEAT_ROOT} \
+  python -m llm_slt.evaluate --ckpt-dir ${CKPT} --manifest ${DATA}/test.jsonl --feat-root ${FEAT_ROOT} --face-root ${FACE_ROOT} \
       --beam ${BEAM} --ablate-stream ${S} --ablation ${ABLATION} --out ${CKPT}/eval/test_beam${BEAM}_${ABLATION}_${S}
 done

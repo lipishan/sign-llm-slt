@@ -13,16 +13,18 @@ LLM=${LLM:-Qwen/Qwen3-1.7B-Base}
 SAVE_DIR=${SAVE_DIR:?set SAVE_DIR}
 DATA=${DATA:-data/llm/ytasl}
 FEAT_ROOT=${FEAT_ROOT:-/mnt/pub/sign_language_datasets/features/YouTube-ASL/osx/video-clips-stacked}
+FACE_ROOT=${FACE_ROOT:-/mnt/pub/sign_language_datasets/features/YouTube-ASL/rtmpose_lmk}   # RTMPose face .pkl files
 
+mkdir -p ${SAVE_DIR}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python -m llm_slt.train \
     --train-manifest ${DATA}/train.jsonl \
     --valid-manifest ${DATA}/valid.jsonl \
-    --feat-root ${FEAT_ROOT} \
+    --feat-root ${FEAT_ROOT} --face-root ${FACE_ROOT} \
     --llm ${LLM} \
     --fusion ${FUSION} \
     --split-face --face-norm similarity \
     --frame-stride 2 --max-frames 256 \
-    --batch-size 16 --grad-accum 2 \
+    --batch-size ${BATCH:-16} --grad-accum ${GRAD_ACCUM:-2} \
     --epochs 10 --warmup-steps 1000 \
     --lr 3e-4 --lora-lr 2e-4 --lora-r 16 --lora-alpha 32 \
     --label-smoothing 0.1 \

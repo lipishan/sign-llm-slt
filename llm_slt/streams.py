@@ -12,6 +12,7 @@ without any fairseq dependency, and adds two options:
 from __future__ import annotations
 
 import os
+import pickle
 from dataclasses import dataclass
 from typing import Dict, List
 
@@ -30,6 +31,8 @@ IBUG68 = {
 UPPER_FACE_IDX = IBUG68["brows"] + IBUG68["eyes"]  # 22 points
 MOUTH_IDX = IBUG68["mouth"]  # 20 points
 LEFT_EYE_OUTER, RIGHT_EYE_OUTER = 36, 45
+# COCO-WholeBody (133 keypoints, RTMPose wholebody): the 68 face points are 23-90, in iBUG-68 order.
+WHOLEBODY_FACE = slice(23, 91)
 
 
 @dataclass(frozen=True)
@@ -79,20 +82,55 @@ def _get(pose, *names):
     raise KeyError(f"none of {names} in pose file; available keys: {pose.files}")
 
 
+def _frames(x: np.ndarray, T: int) -> np.ndarray:
+    """(T0, ...) -> (T, D): flatten per frame and keep the first T frames."""
+    return x.reshape(x.shape[0], -1)[:T]
+
+
+def load_face_pkl(path: str) -> np.ndarray:
+    """Read 68 face landmarks (T, 68, 2) from an RTMPose wholebody .pkl file.
+
+    The file holds {"keypoints": [T x (P, 133, 2)], "scores": [T x (P, 133)]}. The first
+    person is used. Frames with no detection are filled from the nearest detected frame
+    (zeros if the clip has no detection at all).
+    """
+    with open(path, "rb") as f:
+        d = pickle.load(f)
+    frames = []
+    for kp in d["keypoints"]:
+        kp = np.asarray(kp, dtype=np.float64).reshape(-1, 133, 2)
+        frames.append(kp[0, WHOLEBODY_FACE] if kp.shape[0] else None)
+    found = [t for t, x in enumerate(frames) if x is not None]
+    if not found:
+        return np.zeros((len(frames), 68, 2))
+    for t in range(len(frames)):
+        if frames[t] is None:
+            frames[t] = frames[min(found, key=lambda u: abs(u - t))]
+    return np.stack(frames)
+
+
+def face_path(face_root: str, ident: str) -> str:
+    return os.path.join(face_root, ident + ".pkl")
+
+
 def load_pose(path: str, split_face: bool = False, face_norm: str = "none",
-              smooth: bool = True) -> Dict[str, torch.Tensor]:
+              smooth: bool = True, face_file: str | None = None) -> Dict[str, torch.Tensor]:
     """Load one clip's .npz pose file into {stream_name: FloatTensor (T, D)}.
 
     Key names cover both CSI formats (OpenASL with RTMPose face, YouTube-ASL OSX).
+    If `face_file` is given (an RTMPose .pkl, as for YouTube-ASL), the face landmarks
+    come from it instead of the "face_pose" key. If its frame count differs from the
+    .npz, both are cut to the shorter one.
     """
     pose = np.load(path, allow_pickle=True)
     root = _get(pose, "root_pose", "global_orient")
     T = root.shape[0]
-    root = root.reshape(T, -1)
-    body = _get(pose, "body_pose").reshape(T, -1)
-    left = _get(pose, "left_hand_pose", "lhand_pose").reshape(T, -1)
-    right = _get(pose, "right_hand_pose", "rhand_pose").reshape(T, -1)
-    face = _get(pose, "face_pose").reshape(T, 68, 2)
+    face = load_face_pkl(face_file) if face_file else _get(pose, "face_pose").reshape(T, 68, 2)
+    T = min(T, face.shape[0])
+    root = _frames(root, T)
+    body, left, right = (_frames(_get(pose, *names), T) for names in
+                         (("body_pose",), ("left_hand_pose", "lhand_pose"), ("right_hand_pose", "rhand_pose")))
+    face = face[:T]
 
     if face_norm == "similarity":
         face = similarity_normalize(face)

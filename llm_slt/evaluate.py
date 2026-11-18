@@ -79,6 +79,7 @@ def main(argv=None):
     p.add_argument("--checkpoint", default="checkpoint_best.pt")
     p.add_argument("--manifest", required=True)
     p.add_argument("--feat-root", required=True)
+    p.add_argument("--face-root", default=None, help="default: the --face-root used in training")
     p.add_argument("--beam", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--max-new-tokens", type=int, default=64)
@@ -95,7 +96,8 @@ def main(argv=None):
     model.load_trainable_state_dict(torch.load(os.path.join(args.ckpt_dir, args.checkpoint), map_location="cpu"))
     model.to(device).eval()
     ds = SignPoseDataset(args.manifest, args.feat_root, split_face=cfg.split_face, face_norm=targs["face_norm"],
-                         frame_stride=targs["frame_stride"], max_frames=cfg.max_frames)
+                         frame_stride=targs["frame_stride"], max_frames=cfg.max_frames,
+                         face_root=args.face_root or targs.get("face_root"))
     hyps, refs, ids = translate(model, ds, device, args.batch_size, args.beam, args.max_new_tokens,
                                 ablate_stream=args.ablate_stream, ablation=args.ablation)
     metrics = {**score(hyps, refs), "beam": args.beam, "ablate_stream": args.ablate_stream,
