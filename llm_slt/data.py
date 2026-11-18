@@ -3,7 +3,8 @@
 Manifest format: one JSON object per line,
     {"id": "<clip identifier>", "text": "<English reference>", "num_frames": 123}
 `id` is the same identifier the CSI fairseq split files use ("ident"); the pose
-file is <feat_root>/<id>.npz. Build manifests with `python -m llm_slt.make_manifest`.
+file is <feat_root>/<id>.npz. With `face_root` (YouTube-ASL), the face landmarks
+come from <face_root>/<id>.pkl (RTMPose wholebody). Build manifests with `python -m llm_slt.make_manifest`.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ from typing import Dict, List, Optional
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from .streams import load_pose, pose_path, stream_specs
+from .streams import face_path, load_pose, pose_path, stream_specs
 
 
 def read_manifest(path: str) -> List[dict]:
@@ -24,9 +25,11 @@ def read_manifest(path: str) -> List[dict]:
 
 class SignPoseDataset(Dataset):
     def __init__(self, manifest: str, feat_root: str, split_face: bool = False,
-                 face_norm: str = "none", frame_stride: int = 1, max_frames: int = 512):
+                 face_norm: str = "none", frame_stride: int = 1, max_frames: int = 512,
+                 face_root: Optional[str] = None):
         self.items = read_manifest(manifest)
         self.feat_root = feat_root
+        self.face_root = face_root
         self.split_face = split_face
         self.face_norm = face_norm
         self.frame_stride = frame_stride
@@ -42,7 +45,9 @@ class SignPoseDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict:
         item = self.items[i]
-        streams = load_pose(pose_path(self.feat_root, item["id"]), self.split_face, self.face_norm)
+        face_file = face_path(self.face_root, item["id"]) if self.face_root else None
+        streams = load_pose(pose_path(self.feat_root, item["id"]), self.split_face, self.face_norm,
+                            face_file=face_file)
         streams = {k: v[:: self.frame_stride][: self.max_frames] for k, v in streams.items()}
         return {"id": item["id"], "text": item["text"], "streams": streams}
 

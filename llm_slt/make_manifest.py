@@ -37,6 +37,7 @@ def main(argv=None):
     p.add_argument("--split", help="split name, e.g. train (with --decode-fairseq-target)")
     p.add_argument("--src", default="sign")
     p.add_argument("--tgt", default="en")
+    p.add_argument("--face-root", help="drop clips with no <face-root>/<id>.pkl face file (YouTube-ASL)")
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
 
@@ -52,11 +53,16 @@ def main(argv=None):
     if len(texts) != len(items):
         raise ValueError(f"{len(items)} clips but {len(texts)} references")
 
+    pairs = list(zip(items, texts))
+    if args.face_root:
+        have = {os.path.splitext(n)[0] for n in os.listdir(args.face_root)}
+        pairs = [(it, t) for it, t in pairs if it["ident"] in have]
+        print(f"{len(pairs)} of {len(items)} clips have a face file in {args.face_root}")
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
-        for it, text in zip(items, texts):
+        for it, text in pairs:
             f.write(json.dumps({"id": it["ident"], "text": text, "num_frames": it["size"]}) + "\n")
-    print(f"wrote {len(items)} lines to {args.out}")
+    print(f"wrote {len(pairs)} lines to {args.out}")
 
 
 if __name__ == "__main__":

@@ -237,3 +237,54 @@ def test_stream_specs():
     assert [s.name for s in stream_specs(True)] == ["body", "left", "right", "upper_face", "mouth"]
     assert [s.dim for s in stream_specs(True)] == [66, 45, 45, 44, 40]
     assert [s.dim for s in stream_specs(False)] == [66, 45, 45, 136]
+
+
+# ---------------------------------------------------------------- YouTube-ASL: OSX .npz + RTMPose face .pkl
+def _write_ytasl_clip(tmp_path, ident, T_npz, T_pkl, missing=()):
+    import pickle
+    rng = np.random.default_rng(1)
+    np.savez(tmp_path / f"{ident}.npz", root_pose=rng.normal(size=(T_npz, 3)),
+             body_pose=rng.normal(size=(T_npz, 63)), lhand_pose=rng.normal(size=(T_npz, 45)),
+             rhand_pose=rng.normal(size=(T_npz, 45)), jaw_pose=rng.normal(size=(T_npz, 3)),
+             expr=rng.normal(size=(T_npz, 10)))
+    kps = [rng.uniform(0.2, 0.6, size=(1, 133, 2)) for _ in range(T_pkl)]
+    for t in missing:
+        kps[t] = np.zeros((0, 133, 2))
+    with open(tmp_path / f"{ident}.pkl", "wb") as f:
+        pickle.dump({"keypoints": kps, "scores": [np.ones((k.shape[0], 133)) for k in kps]}, f)
+    return kps
+
+
+def test_rtmpose_face_file(tmp_path):
+    from llm_slt.streams import MOUTH_IDX, UPPER_FACE_IDX, face_path, load_pose, pose_path
+    kps = _write_ytasl_clip(tmp_path, "clipA", T_npz=20, T_pkl=20, missing=(3,))
+    out = load_pose(pose_path(str(tmp_path), "clipA"), split_face=True, smooth=False,
+                    face_file=face_path(str(tmp_path), "clipA"))
+    assert {k: tuple(v.shape) for k, v in out.items()} == {
+        "body": (20, 66), "left": (20, 45), "right": (20, 45), "upper_face": (20, 44), "mouth": (20, 40)}
+    face0 = kps[0][0, 23:91]                                      # COCO-WholeBody face = points 23-90
+    assert np.allclose(out["mouth"][0].numpy(), face0[MOUTH_IDX].reshape(-1), atol=1e-6)
+    assert np.allclose(out["upper_face"][0].numpy(), face0[UPPER_FACE_IDX].reshape(-1), atol=1e-6)
+    assert torch.isfinite(out["mouth"]).all()                     # frame 3 had no detection: filled from a neighbour
+    assert np.allclose(out["mouth"][3].numpy(), kps[2][0, 23:91][MOUTH_IDX].reshape(-1), atol=1e-6)
+
+
+def test_rtmpose_face_file_length_mismatch(tmp_path):
+    from llm_slt.streams import face_path, load_pose, pose_path
+    _write_ytasl_clip(tmp_path, "clipB", T_npz=20, T_pkl=18)
+    out = load_pose(pose_path(str(tmp_path), "clipB"), split_face=True, face_norm="similarity",
+                    face_file=face_path(str(tmp_path), "clipB"))
+    assert {v.shape[0] for v in out.values()} == {18}
+
+
+def test_make_manifest_drops_clips_without_face(tmp_path):
+    import json
+    from llm_slt.make_manifest import main
+    (tmp_path / "faces").mkdir()
+    (tmp_path / "faces" / "a.pkl").write_bytes(b"")
+    (tmp_path / "split.json").write_text(json.dumps([{"ident": "a", "size": 5}, {"ident": "b", "size": 7}]))
+    (tmp_path / "ref.en").write_text("hello\nworld\n")
+    main(["--split-json", str(tmp_path / "split.json"), "--text-file", str(tmp_path / "ref.en"),
+          "--face-root", str(tmp_path / "faces"), "--out", str(tmp_path / "out.jsonl")])
+    lines = [json.loads(l) for l in open(tmp_path / "out.jsonl")]
+    assert lines == [{"id": "a", "text": "hello", "num_frames": 5}]

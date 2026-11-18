@@ -30,6 +30,8 @@ def parse_args(argv=None):
     d.add_argument("--train-manifest", required=True)
     d.add_argument("--valid-manifest", required=True)
     d.add_argument("--feat-root", required=True)
+    d.add_argument("--face-root", default=None,
+                   help="folder of RTMPose .pkl face landmarks (YouTube-ASL); default: face_pose in the .npz")
     d.add_argument("--split-face", action=argparse.BooleanOptionalAction, default=True)
     d.add_argument("--face-norm", choices=["none", "similarity"], default="similarity")
     d.add_argument("--frame-stride", type=int, default=2)
@@ -94,7 +96,7 @@ def main(argv=None):
     if args.gradient_checkpointing:
         model.llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    ds_kw = dict(feat_root=args.feat_root, split_face=args.split_face, face_norm=args.face_norm,
+    ds_kw = dict(feat_root=args.feat_root, face_root=args.face_root, split_face=args.split_face, face_norm=args.face_norm,
                  frame_stride=args.frame_stride, max_frames=args.max_frames)
     train_ds = SignPoseDataset(args.train_manifest, **ds_kw)
     valid_ds = SignPoseDataset(args.valid_manifest, **ds_kw)
