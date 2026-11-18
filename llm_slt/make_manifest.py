@@ -13,7 +13,7 @@ give either:
 
 Example:
     python -m llm_slt.make_manifest --split-json data-bin/YTASL/train.sign-en.sign \
-        --text-file raw/YTASL/train.en --out data/llm/ytasl/train.jsonl
+        --text-file raw/openasl/train.en --out data/llm/openasl/train.jsonl
 """
 from __future__ import annotations
 

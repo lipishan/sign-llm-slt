@@ -60,8 +60,8 @@ face landmarks using the outer eye corners, so head motion stays in the body str
 pip install -r requirements.txt
 
 # 1. Manifests (one per split) from the CSI split files + raw English references
-python -m llm_slt.make_manifest --split-json data-bin/YTASL/train.sign-en.sign \
-    --text-file <raw train.en> --out data/llm/ytasl/train.jsonl
+python -m llm_slt.make_manifest --split-json data-bin/openasl_pruned/train.sign-en.sign \
+    --text-file <raw train.en> --out data/llm/openasl/train.jsonl
 
 # 2. Train (Option A, then Option C)
 FUSION=block_diagonal SAVE_DIR=checkpoints/llm/qwen3_A bash run_scripts/llm/train_llm_slt.sh
