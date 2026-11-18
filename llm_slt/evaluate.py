@@ -6,7 +6,7 @@ Also supports single-stream ablations at the input:
                                                 taken from another clip in the batch)
 
 Example:
-    python -m llm_slt.evaluate --ckpt-dir checkpoints/qwen_A --manifest data/llm/ytasl/test.jsonl \
+    python -m llm_slt.evaluate --ckpt-dir checkpoints/qwen_A --manifest data/llm/openasl/test.jsonl \
         --feat-root /path/to/npz --beam 5 --out checkpoints/qwen_A/test
 """
 from __future__ import annotations

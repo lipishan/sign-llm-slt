@@ -11,15 +11,20 @@ set -x -e -u -o pipefail
 FUSION=${FUSION:-block_diagonal}          # block_diagonal (Option A) | full (Option C)
 LLM=${LLM:-Qwen/Qwen3-1.7B-Base}
 SAVE_DIR=${SAVE_DIR:?set SAVE_DIR}
-DATA=${DATA:-data/llm/ytasl}
-FEAT_ROOT=${FEAT_ROOT:-/mnt/pub/sign_language_datasets/features/YouTube-ASL/osx/video-clips-stacked}
-FACE_ROOT=${FACE_ROOT:-/mnt/pub/sign_language_datasets/features/YouTube-ASL/rtmpose_lmk}   # RTMPose face .pkl files
+# Default: OpenASL (face landmarks are inside the .npz as face_pose).
+# YouTube-ASL (pretraining data): DATA=data/llm/ytasl
+#   FEAT_ROOT=/mnt/pub/sign_language_datasets/features/YouTube-ASL/osx/video-clips-stacked
+#   FACE_ROOT=/mnt/pub/sign_language_datasets/features/YouTube-ASL/rtmpose_lmk
+DATA=${DATA:-data/llm/openasl}
+FEAT_ROOT=${FEAT_ROOT:-/mnt/pub/sign_language_datasets/features/OpenASL/smplx_body_wRTMPose_face}
+FACE_ROOT=${FACE_ROOT:-}
+FACE_ARGS=${FACE_ROOT:+--face-root ${FACE_ROOT}}
 
 mkdir -p ${SAVE_DIR}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python -m llm_slt.train \
     --train-manifest ${DATA}/train.jsonl \
     --valid-manifest ${DATA}/valid.jsonl \
-    --feat-root ${FEAT_ROOT} --face-root ${FACE_ROOT} \
+    --feat-root ${FEAT_ROOT} ${FACE_ARGS} \
     --llm ${LLM} \
     --fusion ${FUSION} \
     --split-face --face-norm similarity \

@@ -1,8 +1,8 @@
 """Train SignLLM (Option A: --fusion block_diagonal, Option C: --fusion full).
 
 Example:
-    python -m llm_slt.train --train-manifest data/llm/ytasl/train.jsonl \
-        --valid-manifest data/llm/ytasl/valid.jsonl --feat-root /path/to/npz \
+    python -m llm_slt.train --train-manifest data/llm/openasl/train.jsonl \
+        --valid-manifest data/llm/openasl/valid.jsonl --feat-root /path/to/npz \
         --llm Qwen/Qwen3-1.7B-Base --fusion block_diagonal --save-dir checkpoints/qwen_A
 """
 from __future__ import annotations
