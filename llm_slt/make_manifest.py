@@ -6,9 +6,10 @@ give either:
 
   (a) --text-file: a raw text file with one reference per line, in the same
       order as the JSON split file (the file you passed to preprocess_sign.py), or
-  (b) --decode-fairseq-target: decode the binarized target with the fairseq
-      dictionary and remove sentencepiece (needs fairseq installed, i.e. run it
-      from the CSI repo environment).
+  (b) --decode-fairseq-target: decode the binarized target (<split>.<src>-<tgt>.<tgt>
+      .bin/.idx, "mmap" or "cached" format, or raw text) with dict.<tgt>.txt and remove
+      sentencepiece. This reads the files directly, so fairseq does not need to be
+      installed; it gives the same text as fairseq's Dictionary.string(..., "sentencepiece").
 
 Example:
     python -m llm_slt.make_manifest --split-json data-bin/YTASL/train.sign-en.sign \
@@ -19,13 +20,66 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
+
+import numpy as np
+
+
+# fairseq index dtype codes (fairseq/data/indexed_dataset.py; code 6 was np.float, i.e. float64)
+_FAIRSEQ_DTYPES = {1: np.uint8, 2: np.int8, 3: np.int16, 4: np.int32, 5: np.int64,
+                   6: np.float64, 7: np.double, 8: np.uint16}
+_MMAP_MAGIC, _CACHED_MAGIC = b"MMIDIDX\x00\x00", b"TNTIDX\x00\x00"
+
+
+def read_fairseq_dict(path: str) -> list:
+    """Symbols of a fairseq dict.<lang>.txt: <s>, <pad>, </s>, <unk>, then one '<token> <count>' per line."""
+    symbols = ["<s>", "<pad>", "</s>", "<unk>"]
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line:
+                symbols.append(line[: line.rfind(" ")])
+    return symbols
+
+
+def read_fairseq_indexed(prefix: str) -> list:
+    """Token-id arrays from a fairseq binarized dataset (<prefix>.idx / <prefix>.bin)."""
+    with open(prefix + ".idx", "rb") as f:
+        head = f.read(9)
+        if head == _MMAP_MAGIC:
+            assert struct.unpack("<Q", f.read(8)) == (1,)
+            dtype = _FAIRSEQ_DTYPES[struct.unpack("<B", f.read(1))[0]]
+            n = struct.unpack("<Q", f.read(8))[0]
+            sizes = np.frombuffer(f.read(4 * n), dtype=np.int32)
+            pointers = np.frombuffer(f.read(8 * n), dtype=np.int64)
+            data = np.fromfile(prefix + ".bin", dtype=np.uint8)
+            return [np.frombuffer(data, dtype=dtype, count=int(c), offset=int(p)).astype(np.int64)
+                    for p, c in zip(pointers, sizes)]
+        if head[:8] == _CACHED_MAGIC:
+            f.seek(8)
+            assert struct.unpack("<Q", f.read(8)) == (1,)
+            code, element_size = struct.unpack("<QQ", f.read(16))
+            n, s = struct.unpack("<QQ", f.read(16))
+            dim_offsets = np.frombuffer(f.read(8 * (n + 1)), dtype=np.int64)
+            data_offsets = np.frombuffer(f.read(8 * (n + 1)), dtype=np.int64)
+            data = np.fromfile(prefix + ".bin", dtype=_FAIRSEQ_DTYPES[code])
+            # ids are stored +1 (Lua indexing); fairseq loads them with fix_lua_indexing=True
+            return [data[data_offsets[i]: data_offsets[i + 1]].astype(np.int64) - 1 for i in range(n)]
+    raise ValueError(f"{prefix}.idx is not a fairseq mmap or cached index")
 
 
 def decode_fairseq_target(data_bin: str, split: str, src: str, tgt: str) -> list:
-    from fairseq.data import Dictionary, data_utils
-    d = Dictionary.load(os.path.join(data_bin, f"dict.{tgt}.txt"))
-    ds = data_utils.load_indexed_dataset(os.path.join(data_bin, f"{split}.{src}-{tgt}.{tgt}"), d, None)
-    return [d.string(ds[i], bpe_symbol="sentencepiece") for i in range(len(ds))]
+    """Same output as fairseq Dictionary.string(ids, bpe_symbol="sentencepiece")."""
+    prefix = os.path.join(data_bin, f"{split}.{src}-{tgt}.{tgt}")
+    if os.path.exists(prefix) and not os.path.exists(prefix + ".idx"):   # raw text dataset
+        with open(prefix, encoding="utf-8") as f:
+            return [line.rstrip("\n").replace(" ", "").replace("\u2581", " ").strip() for line in f]
+    symbols = read_fairseq_dict(os.path.join(data_bin, f"dict.{tgt}.txt"))
+    out = []
+    for ids in read_fairseq_indexed(prefix):
+        sent = " ".join(symbols[i] for i in ids if i not in (0, 2))   # drop <s> and </s>
+        out.append(sent.replace(" ", "").replace("\u2581", " ").strip())
+    return out
 
 
 def main(argv=None):

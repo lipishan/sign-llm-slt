@@ -1,6 +1,6 @@
 # llm_slt: LLM-based sign language translation with separable articulator streams
 
-Standalone repo: it does not need fairseq (except optionally in `make_manifest.py`).
+Standalone repo: it does not need fairseq installed, not even to decode the binarized targets.
 It reads the same pose files and split files as the CSI fairseq code, and keeps the
 CSI design of one encoder per stream.
 
