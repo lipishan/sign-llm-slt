@@ -19,7 +19,7 @@ Setup (their feature-extraction versions):
 Example:
     python tools/check_crops.py --shubert-repo ~/SHuBERT \
         --face-model face_landmarker.task --hand-model hand_landmarker.task \
-        --videos /path/to/youtube-asl/clips/*.mp4 --num-clips 8 --out crop_check/
+        --video-dir /path/to/youtube-asl/clips --num-clips 8 --out crop_check/
 """
 from __future__ import annotations
 
@@ -116,12 +116,31 @@ def crops_for_frame(kpe, face_mod, hand_mod, frame_rgb):
     return out
 
 
+def sample_videos(folder, k, seed):
+    """Reservoir-sample k .mp4 paths without holding the whole (huge) listing in memory."""
+    rng, picked, n = random.Random(seed), [], 0
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if f.endswith(".mp4"):
+                n += 1
+                if len(picked) < k:
+                    picked.append(os.path.join(root, f))
+                elif rng.random() < k / n:
+                    picked[rng.randrange(k)] = os.path.join(root, f)
+    if not picked:
+        raise SystemExit(f"no .mp4 files under {folder}")
+    print(f"sampled {len(picked)} of {n} clips under {folder}")
+    return picked
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--shubert-repo", required=True)
     p.add_argument("--face-model", required=True)
     p.add_argument("--hand-model", required=True)
-    p.add_argument("--videos", nargs="+", required=True)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--video-dir", help="folder of .mp4 clips (searched recursively); --num-clips are sampled")
+    src.add_argument("--videos", nargs="+", help="explicit list of video files")
     p.add_argument("--num-clips", type=int, default=8)
     p.add_argument("--frames-per-clip", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
@@ -132,7 +151,7 @@ def main(argv=None):
     import decord
     kpe, face_mod, hand_mod = load_shubert(args.shubert_repo, args.face_model, args.hand_model)
     os.makedirs(args.out, exist_ok=True)
-    videos = sorted(args.videos)
+    videos = sorted(args.videos) if args.videos else sample_videos(args.video_dir, args.num_clips, args.seed)
     random.Random(args.seed).shuffle(videos)
     counts = np.zeros(5)
     n_frames = 0
