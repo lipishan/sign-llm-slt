@@ -185,26 +185,34 @@ class ClipCropper:
         import decord  # noqa: F401  (fail early if missing)
         from check_crops import face_part_crop, load_shubert
         self.args = args
+        if args.threads_per_worker:
+            import cv2
+            import torch
+            torch.set_num_threads(args.threads_per_worker)
+            cv2.setNumThreads(args.threads_per_worker)
         self.face_part_crop = face_part_crop
         self.kpe, self.face, self.hands, self.bbox = load_shubert(args.shubert_repo, args.face_model, args.hand_model)
         self.tmp = tempfile.mkdtemp(prefix="signer_crop_", dir=args.tmp_dir)
         if not args.no_signer_crop:
             from ultralytics import YOLO
             model, device = YOLO(args.yolo_model), args.yolo_device
-            # their crop_clip() builds YOLO(path) for every clip; build it once instead
-            self.bbox.YOLO = lambda _path: (lambda frame: model(frame, device=device, verbose=False))
+            self.yolo = lambda x: model(x, device=device, verbose=False)
 
     def __call__(self, clip_id, path):
         import decord
-        timing = {}
-        t0 = time.time()
+        from signer_crop import signer_crop
+        timing, info = {}, {}
         src, signer_ok = path, False
         if not self.args.no_signer_crop:
             cropped = os.path.join(self.tmp, clip_id + ".mp4")
-            self.bbox.crop_clip(path, os.path.join(self.tmp, "problems.txt"), cropped, self.args.yolo_model)
+            sc = signer_crop(path, cropped, self.yolo, self.bbox, self.args.signer_motion, self.args.yolo_batch)
+            for k in ("read", "yolo", "motion", "choose", "write"):
+                timing["signer_" + k] = sc["t_" + k]
+            info = {k: sc[k] for k in ("width", "height", "max_persons", "motion_ran", "box")}
+            if "error" in sc:
+                info["signer_error"] = sc["error"]
             if os.path.exists(cropped):
                 src, signer_ok = cropped, True
-        timing["signer_crop"] = time.time() - t0
         t0 = time.time()
         vr = decord.VideoReader(src)
         fps = float(vr.get_avg_fps())
@@ -212,6 +220,8 @@ class ClipCropper:
         del vr
         if src != path:
             os.remove(src)
+        timing["decode"] = time.time() - t0
+        t0 = time.time()
         landmarks = []
         for fr in frames:                    # in order: MediaPipe tracks frame to frame
             try:
@@ -225,7 +235,7 @@ class ClipCropper:
         timing["crops"] = time.time() - t0
         return {"id": clip_id, "crops": crops, "found": found, "brow_eye": brow_eye, "boxes": boxes,
                 "frame_index": keep, "fps": fps, "num_frames_total": len(frames),
-                "signer_crop_ok": signer_ok, "timing": timing}
+                "signer_crop_ok": signer_ok, "timing": timing, "info": info}
 
 
 def _as_is(item):
@@ -310,6 +320,11 @@ def parse_args(argv=None):
     p.add_argument("--yolo-model", help="yolov8n.pt (SHuBERT step 1)")
     p.add_argument("--yolo-device", default="cpu", help="cpu or cuda:0 for the signer crop-out")
     p.add_argument("--no-signer-crop", action="store_true")
+    p.add_argument("--signer-motion", choices=["flow", "diff"], default="flow",
+                   help="choosing the signer among several people: SHuBERT's optical flow, or frame differencing")
+    p.add_argument("--yolo-batch", type=int, default=1, help="frames per YOLO call (1 = as SHuBERT)")
+    p.add_argument("--threads-per-worker", type=int, default=1,
+                   help="CPU threads per worker for torch / OpenCV / OpenMP (0 = library defaults)")
     p.add_argument("--dino-face", required=True, help="SHuBERT release: face DINOv2 checkpoint")
     p.add_argument("--dino-hand", required=True, help="SHuBERT release: hand DINOv2 checkpoint")
     p.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16")
@@ -348,6 +363,9 @@ def main(argv=None):
     if not todo:
         return
 
+    if args.threads_per_worker:               # inherited by the spawned workers
+        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+            os.environ[var] = str(args.threads_per_worker)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, args.dtype)
     dino = {"face": load_dino(args.dino_face, device), "hand": load_dino(args.dino_hand, device)}
@@ -355,9 +373,10 @@ def main(argv=None):
                         num_workers=args.num_workers, prefetch_factor=2 if args.num_workers else None,
                         multiprocessing_context="spawn" if args.num_workers else None)
 
-    stats = {"clips": 0, "frames": 0, "kept_frames": 0, "errors": 0,
-             "signer_crop": 0.0, "mediapipe": 0.0, "crops": 0.0, "dino": 0.0, "found": np.zeros(len(STREAMS))}
+    stats = {"clips": 0, "frames": 0, "kept_frames": 0, "errors": 0, "dino": 0.0,
+             "motion_ran": 0, "signer_crop_failed": 0, "found": np.zeros(len(STREAMS)), "cpu": {}}
     errors = open(os.path.join(args.out, f"errors_shard{args.shard}.txt"), "a")
+    per_clip = open(os.path.join(args.out, f"clip_stats_shard{args.shard}.jsonl"), "a")
     t_start = time.time()
     for item in loader:
         if "error" in item:
@@ -371,10 +390,19 @@ def main(argv=None):
             feats[s] = dino_embed(model, item["crops"][s], device, dtype, args.dino_batch_size)
         if device.type == "cuda":
             torch.cuda.synchronize()
-        stats["dino"] += time.time() - t0
+        t_dino = time.time() - t0
+        stats["dino"] += t_dino
         save_clip(args.out, item, feats)
-        for k in ("signer_crop", "mediapipe", "crops"):
-            stats[k] += item["timing"][k]
+        for k, v in item["timing"].items():
+            stats["cpu"][k] = stats["cpu"].get(k, 0.0) + v
+        info = item.get("info", {})
+        stats["motion_ran"] += bool(info.get("motion_ran"))
+        stats["signer_crop_failed"] += (not args.no_signer_crop) and not item["signer_crop_ok"]
+        per_clip.write(json.dumps({"id": item["id"], "frames": item["num_frames_total"],
+                                   "signer_crop_ok": item["signer_crop_ok"], **info,
+                                   "timing": {k: round(v, 3) for k, v in item["timing"].items()},
+                                   "dino": round(t_dino, 3)}) + "\n")
+        per_clip.flush()
         stats["clips"] += 1
         stats["frames"] += item["num_frames_total"]
         stats["kept_frames"] += len(item["frame_index"])
@@ -392,8 +420,12 @@ def main(argv=None):
         "clips": stats["clips"], "errors": stats["errors"], "frames": stats["frames"],
         "kept_frames": stats["kept_frames"], "wall_hours": el / 3600,
         "clips_per_hour": rate * 3600, "frames_per_second": stats["frames"] / max(el, 1e-9),
-        "num_workers": args.num_workers,
-        "cpu_seconds_per_clip": {k: stats[k] / n for k in ("signer_crop", "mediapipe", "crops")},
+        "num_workers": args.num_workers, "threads_per_worker": args.threads_per_worker,
+        "yolo_device": args.yolo_device, "yolo_batch": args.yolo_batch, "signer_motion": args.signer_motion,
+        "mean_frames_per_clip": stats["frames"] / n,
+        "seconds_per_clip_by_part": {k: v / n for k, v in sorted(stats["cpu"].items())},
+        "share_of_clips_with_motion_step": stats["motion_ran"] / n,
+        "signer_crop_failed": stats["signer_crop_failed"],
         "gpu_seconds_per_clip_dino": stats["dino"] / n,
         "detected_share": {s: float(stats["found"][i] / max(1, stats["kept_frames"])) for i, s in enumerate(STREAMS)},
         "available_clips": total_available,
