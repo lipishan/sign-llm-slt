@@ -349,6 +349,8 @@ def main(argv=None):
     os.makedirs(args.out, exist_ok=True)
     t_list = time.time()
     index = index_videos(args.video_dir)
+    if not index:
+        raise SystemExit(f"no .mp4 files found under --video-dir {args.video_dir}")
     ids = None
     if args.manifest:
         with open(args.manifest) as f:

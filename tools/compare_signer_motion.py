@@ -85,7 +85,11 @@ def main(argv=None):
     os.makedirs(os.path.join(args.out, "disagreements"), exist_ok=True)
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ[var] = "1"
-    clips = select_clips(index_videos(args.video_dir), None, args.num_clips, args.seed)
+    index = index_videos(args.video_dir)
+    if not index:
+        raise SystemExit(f"no .mp4 files found under --video-dir {args.video_dir}")
+    clips = select_clips(index, None, args.num_clips, args.seed)
+    print(f"found {len(index)} videos; checking {len(clips)}")
     t_start = time.time()
     recs = []
     with mp.get_context("spawn").Pool(args.num_workers, initializer=_init, initargs=(args,)) as pool, \
