@@ -186,3 +186,45 @@ def test_iter_clips_in_process():
     import _fake_pool_workers as fw
     out = list(ef.iter_clips([("a", ""), ("b", "")], 0, {"delay": {}}, init=fw.init, run=fw.run))
     assert [o["id"] for o in out] == ["a", "b"]
+
+
+def test_iter_clips_survives_a_killed_worker():
+    import _fake_pool_workers as fw
+    todo = [("crash", "")] + [(f"c{i}", "") for i in range(8)]
+    t0 = __import__("time").time()
+    out = list(ef.iter_clips(todo, num_workers=2, init_args={"delay": {}}, init=fw.init, run=fw.run,
+                             max_clip_seconds=3, poll_seconds=0.5))
+    ids = sorted(o["id"] for o in out)
+    assert ids == sorted(c[0] for c in todo)                     # nothing missing, nothing duplicated
+    crash = [o for o in out if o["id"] == "crash"][0]
+    assert "no result" in crash["error"]
+    assert all("error" not in o for o in out if o["id"] != "crash")
+    assert __import__("time").time() - t0 < 60                   # finished instead of hanging
+
+
+def test_save_is_atomic(tmp_path):
+    T = 2
+    item = {"id": "clip", "found": np.ones((T, 5), bool), "brow_eye": np.zeros((T, 18, 3), np.float32),
+            "boxes": {k: np.zeros((T, 4), np.float32) for k in ("face", "left_hand", "right_hand")},
+            "frame_index": np.arange(T), "fps": 30.0, "num_frames_total": T, "signer_crop_ok": True}
+    ef.save_clip(str(tmp_path), item, {s: np.zeros((T, 384), np.float16) for s in ef.STREAMS})
+    assert sorted(os.listdir(tmp_path)) == ["clip.npz"]
+
+
+def test_video_frame_count(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    path = str(tmp_path / "v.mp4")
+    out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MP4V"), 25, (64, 48))
+    for _ in range(17):
+        out.write(np.zeros((48, 64, 3), np.uint8))
+    out.release()
+    assert ef.video_frame_count(path) == 17
+
+
+def test_too_long_clip_is_skipped_before_loading(tmp_path, monkeypatch):
+    args = argparse.Namespace(max_frames_per_clip=100, no_signer_crop=True)
+    cropper = ef.ClipCropper.__new__(ef.ClipCropper)        # skip __init__ (needs MediaPipe)
+    cropper.args = args
+    monkeypatch.setattr(ef, "video_frame_count", lambda p: 5000)
+    with pytest.raises(RuntimeError, match="skipped: 5000 frames"):
+        cropper("clip", "unused.mp4")

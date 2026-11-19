@@ -180,6 +180,15 @@ def crops_for_clip(frames, landmarks, face_mod, hand_mod, face_part_crop, stride
 
 
 # ------------------------------------------------------------------ steps 1-3 (CPU workers)
+def video_frame_count(path):
+    """Frame count from the container header (no decoding)."""
+    import cv2
+    cap = cv2.VideoCapture(path)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return n
+
+
 class ClipCropper:
     def __init__(self, args):
         import decord  # noqa: F401  (fail early if missing)
@@ -202,6 +211,10 @@ class ClipCropper:
         import decord
         from signer_crop import signer_crop
         timing, info = {}, {}
+        n_frames = video_frame_count(path)
+        if self.args.max_frames_per_clip and n_frames > self.args.max_frames_per_clip:
+            # every full-resolution frame is held in memory; a very long clip would exhaust RAM
+            raise RuntimeError(f"skipped: {n_frames} frames > --max-frames-per-clip {self.args.max_frames_per_clip}")
         src, signer_ok = path, False
         if not self.args.no_signer_crop:
             cropped = os.path.join(self.tmp, clip_id + ".mp4")
@@ -256,10 +269,13 @@ def _worker_run(clip):
         return {"id": clip_id, "error": f"{type(e).__name__}: {e}"}
 
 
-def iter_clips(todo, num_workers, init_args, init=_worker_init, run=_worker_run, max_waiting=None):
+def iter_clips(todo, num_workers, init_args, init=_worker_init, run=_worker_run, max_waiting=None,
+               max_clip_seconds=3600, poll_seconds=30):
     """Yield processed clips in the order they finish (not input order, so one long clip
     never stalls the other workers). At most `max_waiting` clips (default 2 per worker)
-    are queued or in progress, which bounds memory."""
+    are queued or in progress, which bounds memory. A clip with no result after
+    `max_clip_seconds` (e.g. its worker was killed) is reported as an error, so a dead
+    worker cannot freeze the run; the pool starts a replacement worker by itself."""
     if num_workers == 0:
         init(init_args)
         for clip in todo:
@@ -270,19 +286,33 @@ def iter_clips(todo, num_workers, init_args, init=_worker_init, run=_worker_run,
     done = queue.Queue()
     clips = iter(todo)
     max_waiting = max_waiting or 2 * num_workers
+    pending = {}                                   # clip id -> submit time
+
     with mp.get_context("spawn").Pool(num_workers, initializer=init, initargs=(init_args,)) as pool:
         def submit():
             clip = next(clips, None)
             if clip is None:
-                return False
+                return
+            pending[clip[0]] = time.time()
             pool.apply_async(run, (clip,), callback=done.put,
                              error_callback=lambda e, c=clip: done.put({"id": c[0], "error": repr(e)}))
-            return True
-        waiting = sum(submit() for _ in range(max_waiting))
-        while waiting:
-            item = done.get()
-            waiting -= 1
-            waiting += submit()
+
+        for _ in range(max_waiting):
+            submit()
+        while pending:
+            try:
+                item = done.get(timeout=poll_seconds)
+            except queue.Empty:
+                # submit time includes time queued behind other clips, so the limit is generous
+                lost = [c for c, t in pending.items() if time.time() - t > max_clip_seconds]
+                for clip_id in lost:
+                    del pending[clip_id]
+                    submit()
+                    yield {"id": clip_id, "error": f"no result after {max_clip_seconds}s (worker killed or stuck)"}
+                continue
+            if pending.pop(item["id"], None) is None:
+                continue                           # late result for a clip already reported lost
+            submit()
             yield item
 
 
@@ -315,7 +345,10 @@ def dino_embed(model, images, device, dtype, batch_size):
 
 
 def save_clip(out_dir, item, feats):
-    np.savez(os.path.join(out_dir, item["id"] + ".npz"),
+    """Write to a temporary file, then rename, so a stopped run never leaves a half-written .npz."""
+    final = os.path.join(out_dir, item["id"] + ".npz")
+    tmp = os.path.join(out_dir, item["id"] + ".partial.npz")
+    np.savez(tmp,
              **{s: feats[s] for s in STREAMS},
              found=item["found"], brow_eye_landmarks=item["brow_eye"].astype(np.float16),
              face_box=item["boxes"]["face"].astype(np.float16),
@@ -323,6 +356,7 @@ def save_clip(out_dir, item, feats):
              right_hand_box=item["boxes"]["right_hand"].astype(np.float16),
              frame_index=item["frame_index"], fps=item["fps"],
              num_frames_total=item["num_frames_total"], signer_crop_ok=item["signer_crop_ok"])
+    os.replace(tmp, final)
 
 
 # ------------------------------------------------------------------ main
@@ -354,6 +388,10 @@ def parse_args(argv=None):
     p.add_argument("--num-workers", type=int, default=max(1, (os.cpu_count() or 2) - 2),
                    help="CPU processes for steps 1-3")
     p.add_argument("--tmp-dir", default=None, help="for signer-cropped clips (e.g. /dev/shm)")
+    p.add_argument("--max-frames-per-clip", type=int, default=3000,
+                   help="skip (and log) longer clips: all their full-resolution frames are held in memory; 0 = no limit")
+    p.add_argument("--max-clip-minutes", type=float, default=60,
+                   help="report a clip as lost if no result after this long (e.g. its worker was killed)")
     p.add_argument("--out", required=True)
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args(argv)
@@ -397,7 +435,7 @@ def main(argv=None):
     errors = open(os.path.join(args.out, f"errors_shard{args.shard}.txt"), "a")
     per_clip = open(os.path.join(args.out, f"clip_stats_shard{args.shard}.jsonl"), "a")
     t_start = time.time()
-    for item in iter_clips(todo, args.num_workers, args):
+    for item in iter_clips(todo, args.num_workers, args, max_clip_seconds=args.max_clip_minutes * 60):
         if "error" in item:
             stats["errors"] += 1
             errors.write(f"{item['id']}\t{item['error']}\n"); errors.flush()

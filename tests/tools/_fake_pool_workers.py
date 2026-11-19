@@ -13,4 +13,7 @@ def run(clip):
     time.sleep(_STATE["delay"].get(clip_id, 0.01))
     if clip_id == "bad":
         raise RuntimeError("boom")
+    if clip_id == "crash":
+        import os
+        os._exit(1)                      # the worker process dies, like an out-of-memory kill
     return {"id": clip_id, "pid_time": time.time()}
