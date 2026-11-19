@@ -238,31 +238,52 @@ class ClipCropper:
                 "signer_crop_ok": signer_ok, "timing": timing, "info": info}
 
 
-def _as_is(item):
-    """Keep numpy arrays as they are (the default would turn them into tensors)."""
-    return item
+_WORKER = {}
 
 
-class _ClipDataset:
-    """torch Dataset over clips; each worker builds its own ClipCropper."""
+def _worker_init(args):
+    _WORKER["cropper"] = ClipCropper(args)
 
-    def __init__(self, clips, args):
-        self.clips, self.args, self.cropper = clips, args, None
 
-    def __len__(self):
-        return len(self.clips)
+def _worker_run(clip):
+    import contextlib
+    import io
+    clip_id, path = clip
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):     # their code prints per frame
+            return _WORKER["cropper"](clip_id, path)
+    except Exception as e:                                  # log and move on, like their problem files
+        return {"id": clip_id, "error": f"{type(e).__name__}: {e}"}
 
-    def __getitem__(self, i):
-        import contextlib
-        import io
-        if self.cropper is None:
-            self.cropper = ClipCropper(self.args)
-        clip_id, path = self.clips[i]
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):     # their code prints per frame
-                return self.cropper(clip_id, path)
-        except Exception as e:                                  # log and move on, like their problem files
-            return {"id": clip_id, "error": f"{type(e).__name__}: {e}"}
+
+def iter_clips(todo, num_workers, init_args, init=_worker_init, run=_worker_run, max_waiting=None):
+    """Yield processed clips in the order they finish (not input order, so one long clip
+    never stalls the other workers). At most `max_waiting` clips (default 2 per worker)
+    are queued or in progress, which bounds memory."""
+    if num_workers == 0:
+        init(init_args)
+        for clip in todo:
+            yield run(clip)
+        return
+    import multiprocessing as mp
+    import queue
+    done = queue.Queue()
+    clips = iter(todo)
+    max_waiting = max_waiting or 2 * num_workers
+    with mp.get_context("spawn").Pool(num_workers, initializer=init, initargs=(init_args,)) as pool:
+        def submit():
+            clip = next(clips, None)
+            if clip is None:
+                return False
+            pool.apply_async(run, (clip,), callback=done.put,
+                             error_callback=lambda e, c=clip: done.put({"id": c[0], "error": repr(e)}))
+            return True
+        waiting = sum(submit() for _ in range(max_waiting))
+        while waiting:
+            item = done.get()
+            waiting -= 1
+            waiting += submit()
+            yield item
 
 
 # ------------------------------------------------------------------ step 4 (GPU)
@@ -344,7 +365,6 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     import torch
-    from torch.utils.data import DataLoader
 
     os.makedirs(args.out, exist_ok=True)
     t_list = time.time()
@@ -371,16 +391,13 @@ def main(argv=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, args.dtype)
     dino = {"face": load_dino(args.dino_face, device), "hand": load_dino(args.dino_hand, device)}
-    loader = DataLoader(_ClipDataset(todo, args), batch_size=None, shuffle=False, collate_fn=_as_is,
-                        num_workers=args.num_workers, prefetch_factor=2 if args.num_workers else None,
-                        multiprocessing_context="spawn" if args.num_workers else None)
 
     stats = {"clips": 0, "frames": 0, "kept_frames": 0, "errors": 0, "dino": 0.0,
              "motion_ran": 0, "signer_crop_failed": 0, "found": np.zeros(len(STREAMS)), "cpu": {}}
     errors = open(os.path.join(args.out, f"errors_shard{args.shard}.txt"), "a")
     per_clip = open(os.path.join(args.out, f"clip_stats_shard{args.shard}.jsonl"), "a")
     t_start = time.time()
-    for item in loader:
+    for item in iter_clips(todo, args.num_workers, args):
         if "error" in item:
             stats["errors"] += 1
             errors.write(f"{item['id']}\t{item['error']}\n"); errors.flush()

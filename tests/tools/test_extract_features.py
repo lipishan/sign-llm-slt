@@ -168,3 +168,21 @@ def test_main_end_to_end_with_fakes(tmp_path, monkeypatch):
     z = np.load(tmp_path / "feats" / "clip0.npz")
     assert z["left_hand"].shape == (2, 384) and z["frame_index"].tolist() == [0, 2]
     ef.main(common + ["--num-clips", "all"])          # rerun: finished clips are skipped
+
+
+def test_iter_clips_returns_in_finish_order_and_survives_errors():
+    import _fake_pool_workers as fw
+    todo = [("slow", ""), ("bad", "")] + [(f"c{i}", "") for i in range(10)]
+    delay = {"slow": 3.0}
+    out = list(ef.iter_clips(todo, num_workers=3, init_args={"delay": delay},
+                             init=fw.init, run=fw.run, max_waiting=4))
+    ids = [o["id"] for o in out]
+    assert sorted(ids) == sorted(c[0] for c in todo)            # every clip comes back once
+    assert ids.index("slow") > ids.index("c5")                  # the slow clip did not hold the rest back
+    assert [o for o in out if o["id"] == "bad"][0]["error"]     # a crash is reported, not fatal
+
+
+def test_iter_clips_in_process():
+    import _fake_pool_workers as fw
+    out = list(ef.iter_clips([("a", ""), ("b", "")], 0, {"delay": {}}, init=fw.init, run=fw.run))
+    assert [o["id"] for o in out] == ["a", "b"]
