@@ -24,6 +24,9 @@ Output: <out>/<clip id>.npz with, for the kept frames,
                                              eyes (NaN if no face); for the linear probe
     face_box, left_hand_box, right_hand_box  (T, 4) float16  normalized x0, y0, x1, y1
                                              (NaN if none); for hand-face overlap
+    body_posture         (T, 14) float32  SHuBERT's body input: MediaPipe nose, shoulders,
+                                          elbows, wrists in their signing-space normalization
+                                          (features/body_features.py); -9999 before the first pose
     frame_index (T,), fps, num_frames_total, signer_crop_ok
 Clip id = video file name without extension.
 
@@ -179,7 +182,29 @@ def crops_for_clip(frames, landmarks, face_mod, hand_mod, face_part_crop, stride
     return crops, found, brow_eye, boxes, np.array(keep)
 
 
-# ------------------------------------------------------------------ steps 1-3 (CPU workers)
+POSE_IDX = [0, 11, 12, 13, 14, 15, 16]          # nose, shoulders, elbows, wrists (body_features.py)
+
+
+def body_posture(landmarks, normalize):
+    """SHuBERT's keypoints_to_numpy() control flow on in-memory landmarks -> (N, 14).
+
+    `normalize` is their normalize_pose_keypoints. A frame without pose reuses the previous
+    one; before the first pose, -9999. (Theirs stores that case as 7x2 instead of 14, which
+    breaks np.array; here it is always 14.)"""
+    prev, out = None, []
+    for lm in landmarks:
+        if lm is not None and lm.get("pose_landmarks") is not None:
+            pts = normalize(lm["pose_landmarks"][0][0:25])
+            cur = np.array([pts[j] for j in POSE_IDX], dtype=np.float64).flatten()
+            prev = cur
+        elif prev is not None:
+            cur = prev
+        else:
+            cur = np.full(14, -9999.0)
+        out.append(cur)
+    return np.array(out, dtype=np.float32).reshape(len(landmarks), 14)
+
+
 def video_frame_count(path):
     """Frame count from the container header (no decoding)."""
     import cv2
@@ -201,6 +226,8 @@ class ClipCropper:
             cv2.setNumThreads(args.threads_per_worker)
         self.face_part_crop = face_part_crop
         self.kpe, self.face, self.hands, self.bbox = load_shubert(args.shubert_repo, args.face_model, args.hand_model)
+        from check_crops import _load
+        self.body = _load("shubert_body_features", os.path.join(args.shubert_repo, "features", "body_features.py"))
         self.tmp = tempfile.mkdtemp(prefix="signer_crop_", dir=args.tmp_dir)
         if not args.no_signer_crop:
             from ultralytics import YOLO
@@ -246,7 +273,8 @@ class ClipCropper:
         crops, found, brow_eye, boxes, keep = crops_for_clip(
             frames, landmarks, self.face, self.hands, self.face_part_crop, self.args.frame_stride)
         timing["crops"] = time.time() - t0
-        return {"id": clip_id, "crops": crops, "found": found, "brow_eye": brow_eye, "boxes": boxes,
+        body = body_posture(landmarks, self.body.normalize_pose_keypoints)[keep]
+        return {"id": clip_id, "crops": crops, "found": found, "brow_eye": brow_eye, "boxes": boxes, "body": body,
                 "frame_index": keep, "fps": fps, "num_frames_total": len(frames),
                 "signer_crop_ok": signer_ok, "timing": timing, "info": info}
 
@@ -354,7 +382,7 @@ def save_clip(out_dir, item, feats):
              face_box=item["boxes"]["face"].astype(np.float16),
              left_hand_box=item["boxes"]["left_hand"].astype(np.float16),
              right_hand_box=item["boxes"]["right_hand"].astype(np.float16),
-             frame_index=item["frame_index"], fps=item["fps"],
+             body_posture=item["body"], frame_index=item["frame_index"], fps=item["fps"],
              num_frames_total=item["num_frames_total"], signer_crop_ok=item["signer_crop_ok"])
     os.replace(tmp, final)
 

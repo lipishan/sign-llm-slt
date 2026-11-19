@@ -101,12 +101,14 @@ def test_saved_file_layout(tmp_path):
     T = 3
     item = {"id": "clip", "found": np.ones((T, 5), bool), "brow_eye": np.zeros((T, 18, 3), np.float32),
             "boxes": {k: np.zeros((T, 4), np.float32) for k in ("face", "left_hand", "right_hand")},
-            "frame_index": np.arange(T), "fps": 30.0, "num_frames_total": T, "signer_crop_ok": True}
+            "frame_index": np.arange(T), "fps": 30.0, "num_frames_total": T, "signer_crop_ok": True,
+            "body": np.zeros((T, 14), np.float32)}
     feats = {s: np.zeros((T, 384), np.float16) for s in ef.STREAMS}
     ef.save_clip(str(tmp_path), item, feats)
     z = np.load(tmp_path / "clip.npz")
     assert {s: z[s].shape for s in ef.STREAMS} == {s: (T, 384) for s in ef.STREAMS}
     assert z["brow_eye_landmarks"].shape == (T, 18, 3) and z["found"].shape == (T, 5)
+    assert z["body_posture"].shape == (T, 14)
 
 
 def test_dino_embed_preprocessing_matches_shubert():
@@ -147,6 +149,7 @@ def test_main_end_to_end_with_fakes(tmp_path, monkeypatch):
             out = ef.crops_for_clip(frames, [lm()] * 4, face, hands, part, stride=2)
             crops, found, brow, boxes, keep = out
             return {"id": clip_id, "crops": crops, "found": found, "brow_eye": brow, "boxes": boxes,
+                    "body": np.zeros((len(keep), 14), np.float32),
                     "frame_index": keep, "fps": 30.0, "num_frames_total": 4, "signer_crop_ok": True,
                     "timing": {"signer_crop": 0.0, "mediapipe": 0.0, "crops": 0.0}}
 
@@ -206,7 +209,8 @@ def test_save_is_atomic(tmp_path):
     T = 2
     item = {"id": "clip", "found": np.ones((T, 5), bool), "brow_eye": np.zeros((T, 18, 3), np.float32),
             "boxes": {k: np.zeros((T, 4), np.float32) for k in ("face", "left_hand", "right_hand")},
-            "frame_index": np.arange(T), "fps": 30.0, "num_frames_total": T, "signer_crop_ok": True}
+            "frame_index": np.arange(T), "fps": 30.0, "num_frames_total": T, "signer_crop_ok": True,
+            "body": np.zeros((T, 14), np.float32)}
     ef.save_clip(str(tmp_path), item, {s: np.zeros((T, 384), np.float16) for s in ef.STREAMS})
     assert sorted(os.listdir(tmp_path)) == ["clip.npz"]
 
@@ -228,3 +232,32 @@ def test_too_long_clip_is_skipped_before_loading(tmp_path, monkeypatch):
     monkeypatch.setattr(ef, "video_frame_count", lambda p: 5000)
     with pytest.raises(RuntimeError, match="skipped: 5000 frames"):
         cropper("clip", "unused.mp4")
+
+
+def _pose(seed):
+    rng = np.random.default_rng(seed)
+    return [[float(x), float(y), 0.0] for x, y in rng.uniform(0.2, 0.8, (33, 2))]
+
+
+def test_body_posture_fallbacks():
+    norm = lambda pts: [p[:2] for p in pts]  # noqa: E731
+    lms = [None, {"pose_landmarks": [_pose(1)]}, {"pose_landmarks": None}, None, {"pose_landmarks": [_pose(2)]}]
+    b = ef.body_posture(lms, norm)
+    assert b.shape == (5, 14) and (b[0] == -9999).all()
+    expect1 = np.array([_pose(1)[j][:2] for j in ef.POSE_IDX]).flatten()
+    assert np.allclose(b[1], expect1) and np.allclose(b[2], expect1) and np.allclose(b[3], expect1)
+    assert np.allclose(b[4], np.array([_pose(2)[j][:2] for j in ef.POSE_IDX]).flatten())
+
+
+@pytest.mark.skipif(not os.environ.get("SHUBERT_REPO"), reason="set SHUBERT_REPO to a SHuBERT clone")
+def test_body_posture_matches_shubert(tmp_path):
+    import json
+    from check_crops import _load
+    bf = _load("bf", os.path.join(os.environ["SHUBERT_REPO"], "features", "body_features.py"))
+    lms = [{"pose_landmarks": [_pose(1)]}, {"pose_landmarks": None}, None, {"pose_landmarks": [_pose(3)]}]
+    (tmp_path / "clip.json").write_text(json.dumps({str(i): lm for i, lm in enumerate(lms)}))
+    bf.keypoints_to_numpy(str(tmp_path / "clip.json"), str(tmp_path / "out"))
+    theirs = np.load(tmp_path / "out" / "clip.npy")
+    ours = ef.body_posture(lms, bf.normalize_pose_keypoints)
+    assert theirs.shape == ours.shape == (4, 14)
+    assert np.allclose(theirs, ours, atol=1e-6)
